@@ -4,8 +4,11 @@ import android.Manifest;
 import android.app.Activity;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.ImageFormat;
+import android.graphics.Paint;
+import android.graphics.RectF;
 import android.hardware.Camera;
 import android.net.Uri;
 import android.os.Bundle;
@@ -23,6 +26,7 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import com.google.zxing.BinaryBitmap;
+import com.google.zxing.BarcodeFormat;
 import com.google.zxing.DecodeHintType;
 import com.google.zxing.MultiFormatReader;
 import com.google.zxing.NotFoundException;
@@ -31,6 +35,7 @@ import com.google.zxing.Result;
 import com.google.zxing.common.GlobalHistogramBinarizer;
 
 import java.io.IOException;
+import java.util.Collections;
 import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
@@ -45,6 +50,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
     private MultiFormatReader qrReader;
     private boolean previewReady;
     private boolean decoding;
+    private boolean autoFocusSupported;
+    private boolean focusing;
     private String lastResult;
 
     @Override
@@ -53,6 +60,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
         buildUi();
 
         Map<DecodeHintType, Object> hints = new EnumMap<>(DecodeHintType.class);
+        hints.put(DecodeHintType.POSSIBLE_FORMATS, Collections.singletonList(BarcodeFormat.QR_CODE));
         hints.put(DecodeHintType.TRY_HARDER, Boolean.TRUE);
         qrReader = new MultiFormatReader();
         qrReader.setHints(hints);
@@ -69,6 +77,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
         FrameLayout root = new FrameLayout(this);
         previewView = new SurfaceView(this);
         root.addView(previewView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT));
+
+        root.addView(new GuideOverlayView(this), new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT));
 
@@ -175,6 +187,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
                 params.setFocusMode(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE);
             } else if (params.getSupportedFocusModes().contains(Camera.Parameters.FOCUS_MODE_AUTO)) {
                 params.setFocusMode(Camera.Parameters.FOCUS_MODE_AUTO);
+                autoFocusSupported = true;
             }
             camera.setParameters(params);
             camera.setDisplayOrientation(displayOrientation());
@@ -212,6 +225,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
         camera.stopPreview();
         camera.release();
         camera = null;
+        autoFocusSupported = false;
+        focusing = false;
     }
 
     @Override
@@ -222,17 +237,66 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
         decoding = true;
         Camera.Size size = source.getParameters().getPreviewSize();
         try {
-            PlanarYUVLuminanceSource luminance = new PlanarYUVLuminanceSource(
-                    data, size.width, size.height, 0, 0, size.width, size.height, false);
-            BinaryBitmap bitmap = new BinaryBitmap(new GlobalHistogramBinarizer(luminance));
-            Result result = qrReader.decodeWithState(bitmap);
+            Result result = decodeAnyRotation(data, size.width, size.height);
             handleResult(result.getText());
         } catch (NotFoundException ignored) {
             decoding = false;
+            requestAutoFocus(source);
         } catch (RuntimeException ignored) {
             decoding = false;
         } finally {
             qrReader.reset();
+        }
+    }
+
+    private Result decodeAnyRotation(byte[] data, int width, int height) throws NotFoundException {
+        try {
+            return decodeLuminance(data, width, height);
+        } catch (NotFoundException ignored) {
+            byte[] rotated = rotateYPlaneClockwise(data, width, height);
+            try {
+                return decodeLuminance(rotated, height, width);
+            } catch (NotFoundException ignoredAgain) {
+                byte[] rotatedTwice = rotateYPlaneClockwise(rotated, height, width);
+                try {
+                    return decodeLuminance(rotatedTwice, width, height);
+                } catch (NotFoundException ignoredThird) {
+                    byte[] rotatedThreeTimes = rotateYPlaneClockwise(rotatedTwice, width, height);
+                    return decodeLuminance(rotatedThreeTimes, height, width);
+                }
+            }
+        }
+    }
+
+    private Result decodeLuminance(byte[] data, int width, int height) throws NotFoundException {
+        PlanarYUVLuminanceSource luminance = new PlanarYUVLuminanceSource(
+                data, width, height, 0, 0, width, height, false);
+        BinaryBitmap bitmap = new BinaryBitmap(new GlobalHistogramBinarizer(luminance));
+        return qrReader.decodeWithState(bitmap);
+    }
+
+    private byte[] rotateYPlaneClockwise(byte[] data, int width, int height) {
+        byte[] rotated = new byte[width * height];
+        int index = 0;
+        for (int x = 0; x < width; x++) {
+            for (int y = height - 1; y >= 0; y--) {
+                rotated[index++] = data[y * width + x];
+            }
+        }
+        return rotated;
+    }
+
+    private void requestAutoFocus(Camera source) {
+        if (!autoFocusSupported || focusing) {
+            return;
+        }
+        try {
+            focusing = true;
+            source.autoFocus((success, camera) -> {
+                focusing = false;
+            });
+        } catch (RuntimeException ignored) {
+            focusing = false;
         }
     }
 
@@ -318,5 +382,56 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
 
     private int dp(int value) {
         return (int) (value * getResources().getDisplayMetrics().density + 0.5f);
+    }
+
+    private static class GuideOverlayView extends View {
+        private final Paint dimPaint = new Paint();
+        private final Paint borderPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint cornerPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final RectF box = new RectF();
+
+        GuideOverlayView(Activity activity) {
+            super(activity);
+            dimPaint.setColor(0x66000000);
+            borderPaint.setColor(0xCCFFFFFF);
+            borderPaint.setStyle(Paint.Style.STROKE);
+            borderPaint.setStrokeWidth(activity.getResources().getDisplayMetrics().density * 2);
+            cornerPaint.setColor(0xFFFFD43B);
+            cornerPaint.setStyle(Paint.Style.STROKE);
+            cornerPaint.setStrokeCap(Paint.Cap.ROUND);
+            cornerPaint.setStrokeWidth(activity.getResources().getDisplayMetrics().density * 6);
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            float width = getWidth();
+            float height = getHeight();
+            float size = Math.min(width * 0.72f, height * 0.48f);
+            float left = (width - size) / 2f;
+            float top = (height - size) / 2f;
+            box.set(left, top, left + size, top + size);
+
+            canvas.drawRect(0, 0, width, box.top, dimPaint);
+            canvas.drawRect(0, box.bottom, width, height, dimPaint);
+            canvas.drawRect(0, box.top, box.left, box.bottom, dimPaint);
+            canvas.drawRect(box.right, box.top, width, box.bottom, dimPaint);
+
+            float radius = 18f;
+            canvas.drawRoundRect(box, radius, radius, borderPaint);
+
+            float corner = size * 0.18f;
+            drawCorner(canvas, box.left, box.top, corner, true, true);
+            drawCorner(canvas, box.right, box.top, corner, false, true);
+            drawCorner(canvas, box.left, box.bottom, corner, true, false);
+            drawCorner(canvas, box.right, box.bottom, corner, false, false);
+        }
+
+        private void drawCorner(Canvas canvas, float x, float y, float length, boolean left, boolean top) {
+            float horizontalEnd = x + (left ? length : -length);
+            float verticalEnd = y + (top ? length : -length);
+            canvas.drawLine(x, y, horizontalEnd, y, cornerPaint);
+            canvas.drawLine(x, y, x, verticalEnd, cornerPaint);
+        }
     }
 }
