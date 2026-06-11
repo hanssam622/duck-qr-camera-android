@@ -4,13 +4,11 @@ import android.Manifest;
 import android.app.Activity;
 import android.content.Intent;
 import android.content.pm.PackageManager;
-import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.ImageFormat;
-import android.graphics.Paint;
-import android.graphics.RectF;
 import android.hardware.Camera;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Vibrator;
 import android.text.TextUtils;
@@ -22,6 +20,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.FrameLayout;
+import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -46,12 +45,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
     private SurfaceView previewView;
     private TextView messageView;
     private Button actionButton;
+    private Button openButton;
     private Camera camera;
     private MultiFormatReader qrReader;
     private boolean previewReady;
     private boolean decoding;
     private boolean autoFocusSupported;
     private boolean focusing;
+    private boolean launchedExternal;
     private String lastResult;
 
     @Override
@@ -68,7 +69,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
         if (hasCameraPermission()) {
             previewView.getHolder().addCallback(this);
         } else {
-            requestPermissions(new String[]{Manifest.permission.CAMERA}, CAMERA_PERMISSION_REQUEST);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                requestPermissions(new String[]{Manifest.permission.CAMERA}, CAMERA_PERMISSION_REQUEST);
+            }
             showMessage("카메라 권한을 허용하면 QR 코드를 스캔할 수 있어요.", false);
         }
     }
@@ -80,13 +83,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT));
 
-        root.addView(new GuideOverlayView(this), new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT));
-
         TextView frame = new TextView(this);
         frame.setBackgroundColor(Color.TRANSPARENT);
-        frame.setText("QR 코드를 화면 가운데에 맞춰 주세요");
+        frame.setText("QR 코드를 비춰 주세요");
         frame.setTextColor(Color.WHITE);
         frame.setTextSize(18);
         frame.setGravity(Gravity.CENTER);
@@ -105,22 +104,43 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
         messageView.setPadding(dp(16), dp(12), dp(16), dp(12));
         messageView.setBackgroundColor(0xCC111111);
 
-        FrameLayout panel = new FrameLayout(this);
+        LinearLayout panel = new LinearLayout(this);
+        panel.setOrientation(LinearLayout.VERTICAL);
+        panel.setGravity(Gravity.CENTER_HORIZONTAL);
         panel.setPadding(dp(12), dp(12), dp(12), dp(12));
-        panel.addView(messageView, new FrameLayout.LayoutParams(
+        panel.addView(messageView, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        LinearLayout buttonRow = new LinearLayout(this);
+        buttonRow.setOrientation(LinearLayout.HORIZONTAL);
+        buttonRow.setGravity(Gravity.CENTER);
+
+        openButton = new Button(this);
+        openButton.setText("링크 열기");
+        openButton.setVisibility(View.GONE);
+        openButton.setOnClickListener(v -> openLastResult());
+        LinearLayout.LayoutParams buttonParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        buttonParams.rightMargin = dp(8);
+        buttonRow.addView(openButton, buttonParams);
 
         actionButton = new Button(this);
         actionButton.setText("다시 스캔");
         actionButton.setVisibility(View.GONE);
         actionButton.setOnClickListener(v -> resumeScanning());
-        FrameLayout.LayoutParams buttonParams = new FrameLayout.LayoutParams(
+        LinearLayout.LayoutParams scanButtonParams = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.CENTER_HORIZONTAL);
-        buttonParams.topMargin = dp(72);
-        panel.addView(actionButton, buttonParams);
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        scanButtonParams.leftMargin = dp(8);
+        buttonRow.addView(actionButton, scanButtonParams);
+
+        LinearLayout.LayoutParams rowParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        rowParams.topMargin = dp(8);
+        panel.addView(buttonRow, rowParams);
 
         FrameLayout.LayoutParams panelParams = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -150,6 +170,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
     @Override
     protected void onResume() {
         super.onResume();
+        if (launchedExternal) {
+            launchedExternal = false;
+            resumeScanning();
+            return;
+        }
         if (hasCameraPermission() && previewReady) {
             startCamera();
         }
@@ -183,11 +208,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
             Camera.Size size = choosePreviewSize(params.getSupportedPreviewSizes());
             params.setPreviewSize(size.width, size.height);
             params.setPreviewFormat(ImageFormat.NV21);
-            if (params.getSupportedFocusModes().contains(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE)) {
-                params.setFocusMode(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE);
-            } else if (params.getSupportedFocusModes().contains(Camera.Parameters.FOCUS_MODE_AUTO)) {
-                params.setFocusMode(Camera.Parameters.FOCUS_MODE_AUTO);
-                autoFocusSupported = true;
+            List<String> focusModes = params.getSupportedFocusModes();
+            if (focusModes != null) {
+                if (focusModes.contains(Camera.Parameters.FOCUS_MODE_CONTINUOUS_VIDEO)) {
+                    params.setFocusMode(Camera.Parameters.FOCUS_MODE_CONTINUOUS_VIDEO);
+                } else if (focusModes.contains(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE)) {
+                    params.setFocusMode(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE);
+                } else if (focusModes.contains(Camera.Parameters.FOCUS_MODE_AUTO)) {
+                    params.setFocusMode(Camera.Parameters.FOCUS_MODE_AUTO);
+                    autoFocusSupported = true;
+                } else if (focusModes.contains(Camera.Parameters.FOCUS_MODE_MACRO)) {
+                    params.setFocusMode(Camera.Parameters.FOCUS_MODE_MACRO);
+                }
             }
             camera.setParameters(params);
             camera.setDisplayOrientation(displayOrientation());
@@ -195,7 +227,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
             camera.setPreviewCallback(this);
             camera.startPreview();
             decoding = false;
-            showMessage("QR 코드를 비추면 자동으로 링크를 열어요.", false);
+            showMessage("QR 코드를 비추면 내용을 확인한 뒤 링크를 열 수 있어요.", false);
         } catch (IOException | RuntimeException e) {
             showMessage("카메라를 시작할 수 없습니다.", false);
             stopCamera();
@@ -307,34 +339,76 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
         }
         lastResult = text;
         vibrate();
+        pausePreview();
 
         if (isUrl(text)) {
-            showMessage("링크를 열고 있어요:\n" + text, true);
-            Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(normalizeUrl(text)));
-            try {
-                startActivity(intent);
-            } catch (RuntimeException e) {
-                Toast.makeText(this, "링크를 열 수 없습니다.", Toast.LENGTH_SHORT).show();
-            }
+            showMessage("링크를 열까요?\n" + text, true);
+            openButton.setVisibility(View.VISIBLE);
         } else {
             showMessage("QR 내용:\n" + text, true);
+            openButton.setVisibility(View.GONE);
+        }
+    }
+
+    private void pausePreview() {
+        if (camera == null) {
+            return;
+        }
+        try {
+            camera.setPreviewCallback(null);
+            camera.stopPreview();
+        } catch (RuntimeException ignored) {
         }
     }
 
     private void resumeScanning() {
         lastResult = null;
         decoding = false;
+        focusing = false;
+        openButton.setVisibility(View.GONE);
         actionButton.setVisibility(View.GONE);
-        showMessage("QR 코드를 비추면 자동으로 링크를 열어요.", false);
+        if (hasCameraPermission() && previewReady) {
+            if (camera == null) {
+                startCamera();
+            } else {
+                try {
+                    camera.setPreviewDisplay(previewView.getHolder());
+                    camera.setPreviewCallback(this);
+                    camera.startPreview();
+                } catch (IOException | RuntimeException e) {
+                    stopCamera();
+                    startCamera();
+                }
+            }
+        }
+        showMessage("QR 코드를 비추면 내용을 확인한 뒤 링크를 열 수 있어요.", false);
+    }
+
+    private void openLastResult() {
+        if (TextUtils.isEmpty(lastResult) || !isUrl(lastResult)) {
+            return;
+        }
+        Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(normalizeUrl(lastResult)));
+        try {
+            launchedExternal = true;
+            startActivity(intent);
+        } catch (RuntimeException e) {
+            launchedExternal = false;
+            Toast.makeText(this, "링크를 열 수 없습니다.", Toast.LENGTH_SHORT).show();
+        }
     }
 
     private void showMessage(String message, boolean resultVisible) {
         messageView.setText(message);
         actionButton.setVisibility(resultVisible ? View.VISIBLE : View.GONE);
+        if (!resultVisible) {
+            openButton.setVisibility(View.GONE);
+        }
     }
 
     private boolean hasCameraPermission() {
-        return checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED;
+        return Build.VERSION.SDK_INT < Build.VERSION_CODES.M
+                || checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED;
     }
 
     private Camera.Size choosePreviewSize(List<Camera.Size> sizes) {
@@ -382,56 +456,5 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
 
     private int dp(int value) {
         return (int) (value * getResources().getDisplayMetrics().density + 0.5f);
-    }
-
-    private static class GuideOverlayView extends View {
-        private final Paint dimPaint = new Paint();
-        private final Paint borderPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final Paint cornerPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final RectF box = new RectF();
-
-        GuideOverlayView(Activity activity) {
-            super(activity);
-            dimPaint.setColor(0x66000000);
-            borderPaint.setColor(0xCCFFFFFF);
-            borderPaint.setStyle(Paint.Style.STROKE);
-            borderPaint.setStrokeWidth(activity.getResources().getDisplayMetrics().density * 2);
-            cornerPaint.setColor(0xFFFFD43B);
-            cornerPaint.setStyle(Paint.Style.STROKE);
-            cornerPaint.setStrokeCap(Paint.Cap.ROUND);
-            cornerPaint.setStrokeWidth(activity.getResources().getDisplayMetrics().density * 6);
-        }
-
-        @Override
-        protected void onDraw(Canvas canvas) {
-            super.onDraw(canvas);
-            float width = getWidth();
-            float height = getHeight();
-            float size = Math.min(width * 0.72f, height * 0.48f);
-            float left = (width - size) / 2f;
-            float top = (height - size) / 2f;
-            box.set(left, top, left + size, top + size);
-
-            canvas.drawRect(0, 0, width, box.top, dimPaint);
-            canvas.drawRect(0, box.bottom, width, height, dimPaint);
-            canvas.drawRect(0, box.top, box.left, box.bottom, dimPaint);
-            canvas.drawRect(box.right, box.top, width, box.bottom, dimPaint);
-
-            float radius = 18f;
-            canvas.drawRoundRect(box, radius, radius, borderPaint);
-
-            float corner = size * 0.18f;
-            drawCorner(canvas, box.left, box.top, corner, true, true);
-            drawCorner(canvas, box.right, box.top, corner, false, true);
-            drawCorner(canvas, box.left, box.bottom, corner, true, false);
-            drawCorner(canvas, box.right, box.bottom, corner, false, false);
-        }
-
-        private void drawCorner(Canvas canvas, float x, float y, float length, boolean left, boolean top) {
-            float horizontalEnd = x + (left ? length : -length);
-            float verticalEnd = y + (top ? length : -length);
-            canvas.drawLine(x, y, horizontalEnd, y, cornerPaint);
-            canvas.drawLine(x, y, x, verticalEnd, cornerPaint);
-        }
     }
 }
