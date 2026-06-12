@@ -32,6 +32,7 @@ import com.google.zxing.NotFoundException;
 import com.google.zxing.PlanarYUVLuminanceSource;
 import com.google.zxing.Result;
 import com.google.zxing.common.GlobalHistogramBinarizer;
+import com.google.zxing.common.HybridBinarizer;
 
 import java.io.IOException;
 import java.util.Collections;
@@ -47,12 +48,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
     private Button actionButton;
     private Button openButton;
     private Camera camera;
+    private int currentCameraId;
     private MultiFormatReader qrReader;
     private boolean previewReady;
     private boolean decoding;
     private boolean autoFocusSupported;
     private boolean focusing;
     private boolean launchedExternal;
+    private long lastAutoFocusTime;
     private String lastResult;
 
     @Override
@@ -203,7 +206,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
             return;
         }
         try {
-            camera = Camera.open();
+            currentCameraId = backCameraId();
+            camera = Camera.open(currentCameraId);
             Camera.Parameters params = camera.getParameters();
             Camera.Size size = choosePreviewSize(params.getSupportedPreviewSizes());
             params.setPreviewSize(size.width, size.height);
@@ -257,8 +261,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
         camera.stopPreview();
         camera.release();
         camera = null;
-        autoFocusSupported = false;
-        focusing = false;
+            autoFocusSupported = false;
+            focusing = false;
+            lastAutoFocusTime = 0L;
     }
 
     @Override
@@ -303,8 +308,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
     private Result decodeLuminance(byte[] data, int width, int height) throws NotFoundException {
         PlanarYUVLuminanceSource luminance = new PlanarYUVLuminanceSource(
                 data, width, height, 0, 0, width, height, false);
-        BinaryBitmap bitmap = new BinaryBitmap(new GlobalHistogramBinarizer(luminance));
-        return qrReader.decodeWithState(bitmap);
+        try {
+            BinaryBitmap bitmap = new BinaryBitmap(new HybridBinarizer(luminance));
+            return qrReader.decodeWithState(bitmap);
+        } catch (NotFoundException ignored) {
+            BinaryBitmap fallback = new BinaryBitmap(new GlobalHistogramBinarizer(luminance));
+            return qrReader.decodeWithState(fallback);
+        }
     }
 
     private byte[] rotateYPlaneClockwise(byte[] data, int width, int height) {
@@ -319,11 +329,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
     }
 
     private void requestAutoFocus(Camera source) {
-        if (!autoFocusSupported || focusing) {
+        long now = System.currentTimeMillis();
+        if (!autoFocusSupported || focusing || now - lastAutoFocusTime < 1800) {
             return;
         }
         try {
             focusing = true;
+            lastAutoFocusTime = now;
             source.autoFocus((success, camera) -> {
                 focusing = false;
             });
@@ -413,19 +425,37 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
 
     private Camera.Size choosePreviewSize(List<Camera.Size> sizes) {
         Camera.Size best = sizes.get(0);
+        int targetWidth = 640;
+        int targetHeight = 480;
+        int bestScore = Integer.MAX_VALUE;
         for (Camera.Size size : sizes) {
             int pixels = size.width * size.height;
-            int bestPixels = best.width * best.height;
-            if (pixels > bestPixels && pixels <= 1280 * 720) {
+            if (pixels > 1280 * 720) {
+                continue;
+            }
+            int score = Math.abs(size.width - targetWidth) + Math.abs(size.height - targetHeight);
+            if (score < bestScore) {
+                bestScore = score;
                 best = size;
             }
         }
         return best;
     }
 
+    private int backCameraId() {
+        Camera.CameraInfo info = new Camera.CameraInfo();
+        for (int i = 0; i < Camera.getNumberOfCameras(); i++) {
+            Camera.getCameraInfo(i, info);
+            if (info.facing == Camera.CameraInfo.CAMERA_FACING_BACK) {
+                return i;
+            }
+        }
+        return 0;
+    }
+
     private int displayOrientation() {
         Camera.CameraInfo info = new Camera.CameraInfo();
-        Camera.getCameraInfo(0, info);
+        Camera.getCameraInfo(currentCameraId, info);
         int rotation = getWindowManager().getDefaultDisplay().getRotation();
         int degrees = 0;
         if (rotation == Surface.ROTATION_90) degrees = 90;
